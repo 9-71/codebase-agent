@@ -1,0 +1,22 @@
+services:
+  agent:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      MODEL_BACKEND: ${MODEL_BACKEND:-fake}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434/v1}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:3b}
+      REPO_ROOT: /workspace
+    volumes:
+      - .:/workspace:ro
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["ollama"]
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+
+volumes:
+  ollama-data:
