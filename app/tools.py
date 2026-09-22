@@ -44,10 +44,15 @@ class CodebaseTools:
             {"type": "function", "function": {"name": "run_pytest", "description": "Run pytest on an allowed test path.", "parameters": {"type": "object", "properties": {"test_path": {"type": "string"}}, "required": ["test_path"]}}},
         ]
 
-    def _safe_path(self, relative: str) -> Path:
-        candidate = (self.repo_root / relative).resolve()
-        if candidate != self.repo_root and self.repo_root not in candidate.parents:
+    def _safe_path(self, path: str | Path, *, allowed_root: Path | None = None) -> Path:
+        try:
+            candidate = (self.repo_root / path).resolve()
+        except (OSError, RuntimeError) as exc:
+            raise ToolError("Access denied: path could not be resolved") from exc
+        if not candidate.is_relative_to(self.repo_root):
             raise ToolError("Access denied: path outside working directory (path escapes repository root)")
+        if allowed_root is not None and not candidate.is_relative_to(allowed_root):
+            raise ToolError("Access denied: path escapes allowed tests directory")
         return candidate
 
     def _is_search_excluded(self, path: Path) -> bool:
@@ -61,12 +66,14 @@ class CodebaseTools:
         for path in self.repo_root.rglob("*"):
             if self._is_search_excluded(path):
                 continue
-            if not path.is_file():
-                continue
-            if path.stat().st_size > 512_000:
+            try:
+                target = self._safe_path(path)
+            except ToolError:
                 continue
             try:
-                for line_no, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+                if not target.is_file() or target.stat().st_size > 512_000:
+                    continue
+                for line_no, line in enumerate(target.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
                     if query.lower() in line.lower():
                         matches.append(f"{path.relative_to(self.repo_root)}:{line_no}: {line[:240]}")
                         if len(matches) >= 20:
@@ -94,22 +101,15 @@ class CodebaseTools:
             or not fnmatch.fnmatch(requested.name, "test_*.py")
         ):
             raise ToolError("pytest is limited to tests/test_*.py")
-        target = self._safe_path(test_path)
+        allowed_tests = self.repo_root / "tests"
+        target = self._safe_path(test_path, allowed_root=allowed_tests)
         if not target.is_file():
+            if (self.repo_root / requested).is_symlink():
+                raise ToolError("test file does not exist")
             fallback = self.repo_root / "tests" / "fixture_repo" / requested
-            if fallback.is_file():
-                target = fallback
-            else:
-                candidates = sorted(
-                    path
-                    for path in self.repo_root.rglob(requested.name)
-                    if path.is_file()
-                    and not self._is_search_excluded(path)
-                    and "tests" in {part.lower() for part in path.relative_to(self.repo_root).parts}
-                )
-                if not candidates:
-                    raise ToolError("test file does not exist")
-                target = candidates[0]
+            target = self._safe_path(fallback, allowed_root=allowed_tests)
+            if not target.is_file():
+                raise ToolError("test file does not exist")
         command_path = target.relative_to(self.repo_root).as_posix()
         try:
             completed = subprocess.run(
