@@ -1,10 +1,11 @@
 from pathlib import Path
 import asyncio
 import fnmatch
-import subprocess
-import sys
+import threading
 import time
 from typing import Any, Callable
+
+from .pytest_runner import run_pytest_process
 
 
 class ToolError(Exception):
@@ -92,6 +93,9 @@ class CodebaseTools:
         return {"path": path, "start_line": start_line, "end_line": min(end_line, len(lines)), "content": "\n".join(lines[start_line - 1:end_line])}
 
     def run_pytest(self, test_path: str) -> dict[str, Any]:
+        return self._run_pytest(test_path, cancelled=threading.Event())
+
+    def _run_pytest(self, test_path: str, *, cancelled: threading.Event) -> dict[str, Any]:
         requested = Path(test_path)
         if (
             requested.is_absolute()
@@ -104,32 +108,40 @@ class CodebaseTools:
         allowed_tests = self.repo_root / "tests"
         target = self._safe_path(test_path, allowed_root=allowed_tests)
         if not target.is_file():
-            if (self.repo_root / requested).is_symlink():
-                raise ToolError("test file does not exist")
-            fallback = self.repo_root / "tests" / "fixture_repo" / requested
-            target = self._safe_path(fallback, allowed_root=allowed_tests)
-            if not target.is_file():
-                raise ToolError("test file does not exist")
+            raise ToolError("test file does not exist")
         command_path = target.relative_to(self.repo_root).as_posix()
         try:
-            completed = subprocess.run(
-                [sys.executable, "-m", "pytest", command_path, "-q", "-p", "no:cacheprovider"],
-                cwd=self.repo_root,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout_seconds,
-                check=False,
-            )
-        except subprocess.TimeoutExpired as exc:
+            return run_pytest_process(self.repo_root, command_path, self.timeout_seconds, cancelled)
+        except TimeoutError as exc:
             raise ToolError("pytest timed out") from exc
-        output = (completed.stdout + completed.stderr)[-4000:]
-        return {"status": "passed" if completed.returncode == 0 else "failed", "returncode": completed.returncode, "output": output}
+        except OSError as exc:
+            raise ToolError(f"pytest execution failed: {exc}") from exc
 
     async def invoke(self, name: str, arguments: dict[str, Any]) -> tuple[dict[str, Any], float]:
         handler = self._handlers.get(name)
         if handler is None:
             raise ToolError(f"unknown tool: {name}")
         started = time.perf_counter()
+        if name == "run_pytest":
+            cancelled = threading.Event()
+            worker = asyncio.create_task(asyncio.to_thread(self._run_pytest, cancelled=cancelled, **arguments))
+            try:
+                # The runner owns the deadline and completes cleanup before it
+                # returns. Cancelling an asyncio wait cannot stop a thread.
+                result = await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                cancelled.set()
+                while not worker.done():
+                    try:
+                        await asyncio.shield(worker)
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception:
+                        break
+                if not worker.cancelled():
+                    worker.exception()  # retrieve a cleanup/cancellation error
+                raise
+            return result, (time.perf_counter() - started) * 1000
         try:
             result = await asyncio.wait_for(asyncio.to_thread(handler, **arguments), timeout=self.timeout_seconds)
         except asyncio.TimeoutError as exc:

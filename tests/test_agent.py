@@ -127,8 +127,11 @@ def test_allowlisted_pytest_is_executed() -> None:
     assert result["status"] == "passed"
 
 
-def test_pytest_path_falls_back_to_fixture_repo() -> None:
-    result = CodebaseTools(Path(__file__).parent.parent).run_pytest("tests/test_smoke.py")
+def test_pytest_fixture_requires_explicit_path() -> None:
+    tools = CodebaseTools(Path(__file__).parent.parent)
+    with pytest.raises(ToolError, match="test file does not exist"):
+        tools.run_pytest("tests/test_smoke.py")
+    result = tools.run_pytest("tests/fixture_repo/tests/test_smoke.py")
     assert result["status"] == "passed"
 
 
@@ -143,7 +146,7 @@ def test_pytest_allows_in_repo_test_symlink(tmp_path: Path) -> None:
     assert CodebaseTools(repo, timeout_seconds=10).run_pytest("tests/test_link.py")["status"] == "passed"
 
 
-@pytest.mark.parametrize("location", ["direct", "fallback", "intermediate"])
+@pytest.mark.parametrize("location", ["direct", "nested", "intermediate"])
 def test_pytest_rejects_external_symlinks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, location: str) -> None:
     repo = tmp_path / "repo"
     (repo / "tests").mkdir(parents=True)
@@ -154,19 +157,20 @@ def test_pytest_rejects_external_symlinks(tmp_path: Path, monkeypatch: pytest.Mo
 
     if location == "direct":
         make_symlink(repo / "tests" / "test_escape.py", external_test)
-    elif location == "fallback":
+    elif location == "nested":
         fallback_dir = repo / "tests" / "fixture_repo" / "tests"
         fallback_dir.mkdir(parents=True)
         make_symlink(fallback_dir / "test_escape.py", external_test)
     else:
         make_symlink(repo / "tests" / "fixture_repo", external, directory=True)
 
-    monkeypatch.setattr("app.tools.subprocess.run", lambda *args, **kwargs: pytest.fail("pytest must not run"))
+    test_path = "tests/test_escape.py" if location == "direct" else "tests/fixture_repo/tests/test_escape.py"
+    monkeypatch.setattr("app.tools.run_pytest_process", lambda *args, **kwargs: pytest.fail("pytest must not run"))
     with pytest.raises(ToolError, match="escapes repository root"):
-        CodebaseTools(repo).run_pytest("tests/test_escape.py")
+        CodebaseTools(repo).run_pytest(test_path)
 
 
-def test_pytest_checks_resolved_fallback_location(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_pytest_checks_resolved_nested_location(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     repo = tmp_path / "repo"
     fallback = repo / "tests" / "fixture_repo" / "tests" / "test_escape.py"
     fallback.parent.mkdir(parents=True)
@@ -182,9 +186,9 @@ def test_pytest_checks_resolved_fallback_location(tmp_path: Path, monkeypatch: p
         return original_resolve(path, *args, **kwargs)
 
     monkeypatch.setattr(Path, "resolve", resolve_path)
-    monkeypatch.setattr("app.tools.subprocess.run", lambda *args, **kwargs: pytest.fail("pytest must not run"))
+    monkeypatch.setattr("app.tools.run_pytest_process", lambda *args, **kwargs: pytest.fail("pytest must not run"))
     with pytest.raises(ToolError, match="escapes repository root"):
-        tools.run_pytest("tests/test_escape.py")
+        tools.run_pytest("tests/fixture_repo/tests/test_escape.py")
 
 
 @pytest.mark.parametrize("destination", ["outside_repo", "outside_tests"])
@@ -204,7 +208,7 @@ def test_pytest_checks_resolved_direct_location(tmp_path: Path, monkeypatch: pyt
         return original_resolve(path, *args, **kwargs)
 
     monkeypatch.setattr(Path, "resolve", resolve_path)
-    monkeypatch.setattr("app.tools.subprocess.run", lambda *args, **kwargs: pytest.fail("pytest must not run"))
+    monkeypatch.setattr("app.tools.run_pytest_process", lambda *args, **kwargs: pytest.fail("pytest must not run"))
     with pytest.raises(ToolError, match="repository root|allowed tests directory"):
         tools.run_pytest("tests/test_escape.py")
 
@@ -216,7 +220,7 @@ def test_pytest_rejects_test_symlink_to_non_test_repo_file(tmp_path: Path, monke
     source.write_text("def test_escape(): raise AssertionError('unexpected test executed')\n", encoding="utf-8")
     make_symlink(repo / "tests" / "test_escape.py", source)
 
-    monkeypatch.setattr("app.tools.subprocess.run", lambda *args, **kwargs: pytest.fail("pytest must not run"))
+    monkeypatch.setattr("app.tools.run_pytest_process", lambda *args, **kwargs: pytest.fail("pytest must not run"))
     with pytest.raises(ToolError, match="allowed tests directory"):
         CodebaseTools(repo).run_pytest("tests/test_escape.py")
 
@@ -229,7 +233,7 @@ def test_pytest_broken_symlink_does_not_select_fallback(tmp_path: Path, monkeypa
     fallback_dir.mkdir(parents=True)
     (fallback_dir / "test_missing.py").write_text("def test_missing(): raise AssertionError('fallback test executed')\n", encoding="utf-8")
 
-    monkeypatch.setattr("app.tools.subprocess.run", lambda *args, **kwargs: pytest.fail("pytest must not run"))
+    monkeypatch.setattr("app.tools.run_pytest_process", lambda *args, **kwargs: pytest.fail("pytest must not run"))
     with pytest.raises(ToolError, match="test file does not exist"):
         CodebaseTools(repo).run_pytest("tests/test_missing.py")
 
@@ -241,7 +245,7 @@ def test_pytest_does_not_search_for_same_named_file(tmp_path: Path, monkeypatch:
     other.mkdir(parents=True)
     (other / "test_unexpected.py").write_text("def test_unexpected(): raise AssertionError('unexpected test executed')\n", encoding="utf-8")
 
-    monkeypatch.setattr("app.tools.subprocess.run", lambda *args, **kwargs: pytest.fail("pytest must not run"))
+    monkeypatch.setattr("app.tools.run_pytest_process", lambda *args, **kwargs: pytest.fail("pytest must not run"))
     with pytest.raises(ToolError, match="test file does not exist"):
         CodebaseTools(repo).run_pytest("tests/test_unexpected.py")
 
