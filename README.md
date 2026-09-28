@@ -121,6 +121,10 @@ Interactive OpenAPI documentation is available at `/docs` when the service is ru
 
 The agent can only read files below `REPO_ROOT`. Path traversal is rejected with a structured tool error. File reads are size- and line-bounded. Pytest execution accepts only paths under `tests/` whose filename matches `test_*.py`; arbitrary shell commands are not exposed.
 
+Pytest output is drained in bounded chunks, retaining the last 4,000 characters per stream and returning the last 4,000 characters of stdout followed by stderr. Timeout, cancellation, and normal exit clean up the process group on POSIX or a Job Object on Windows, including descendants that keep output pipes open. Windows uses a gated launcher so pytest starts only after job assignment; its stdin reaches EOF after launch. Invalid output bytes are replaced during decoding.
+
+This manages process lifetime and the agent's output buffers; it is not a sandbox for untrusted tests. Tests can still write files or consume resources, including pytest's own capture storage. Deliberately detached POSIX descendants can escape their process group. Cleanup may extend a timeout briefly while the direct child is reaped and pipes are drained (the final drain is limited to one second).
+
 Repository text is treated as untrusted evidence. It is length-limited before being passed back to the model and cannot replace the system instruction.
 
 ## Project Layout

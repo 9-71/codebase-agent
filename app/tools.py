@@ -1,10 +1,17 @@
 from pathlib import Path
 import asyncio
+from contextvars import ContextVar
 import fnmatch
 import subprocess
 import sys
+import threading
 import time
 from typing import Any, Callable
+
+from ._pytest_process import run_pytest_process
+
+
+_pytest_cancellation: ContextVar[threading.Event | None] = ContextVar("pytest_cancellation", default=None)
 
 
 class ToolError(Exception):
@@ -112,24 +119,46 @@ class CodebaseTools:
                 raise ToolError("test file does not exist")
         command_path = target.relative_to(self.repo_root).as_posix()
         try:
-            completed = subprocess.run(
+            returncode, output = run_pytest_process(
                 [sys.executable, "-m", "pytest", command_path, "-q", "-p", "no:cacheprovider"],
                 cwd=self.repo_root,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout_seconds,
-                check=False,
+                timeout=self.timeout_seconds, cancelled=_pytest_cancellation.get() or threading.Event(),
             )
         except subprocess.TimeoutExpired as exc:
             raise ToolError("pytest timed out") from exc
-        output = (completed.stdout + completed.stderr)[-4000:]
-        return {"status": "passed" if completed.returncode == 0 else "failed", "returncode": completed.returncode, "output": output}
+        return {"status": "passed" if returncode == 0 else "failed", "returncode": returncode, "output": output}
 
     async def invoke(self, name: str, arguments: dict[str, Any]) -> tuple[dict[str, Any], float]:
         handler = self._handlers.get(name)
         if handler is None:
             raise ToolError(f"unknown tool: {name}")
         started = time.perf_counter()
+        if name == "run_pytest":
+            cancelled = threading.Event()
+            token = _pytest_cancellation.set(cancelled)
+            try:
+                worker = asyncio.create_task(asyncio.to_thread(handler, **arguments))
+            finally:
+                _pytest_cancellation.reset(token)
+            try:
+                result = await asyncio.wait_for(asyncio.shield(worker), timeout=self.timeout_seconds)
+            except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
+                cancelled.set()
+                # to_thread cancellation does not stop the thread. Keep its
+                # task alive and wait for cleanup, even on repeated cancellation.
+                while not worker.done():
+                    try:
+                        await asyncio.shield(worker)
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception:
+                        break
+                if not worker.cancelled():
+                    worker.exception()  # Retrieve any cleanup/timeout exception.
+                if isinstance(exc, asyncio.TimeoutError):
+                    raise ToolError("tool timed out") from exc
+                raise
+            return result, (time.perf_counter() - started) * 1000
         try:
             result = await asyncio.wait_for(asyncio.to_thread(handler, **arguments), timeout=self.timeout_seconds)
         except asyncio.TimeoutError as exc:
