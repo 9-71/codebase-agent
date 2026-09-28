@@ -2,6 +2,7 @@ import asyncio
 from pathlib import Path
 import sys
 import time
+import tracemalloc
 
 import pytest
 from fastapi.testclient import TestClient
@@ -130,6 +131,89 @@ def test_allowlisted_pytest_is_executed() -> None:
 def test_pytest_path_falls_back_to_fixture_repo() -> None:
     result = CodebaseTools(Path(__file__).parent.parent).run_pytest("tests/test_smoke.py")
     assert result["status"] == "passed"
+
+
+def test_pytest_output_is_bounded_while_running(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    tests_dir = repo / "tests"
+    tests_dir.mkdir(parents=True)
+    (tests_dir / "test_output.py").write_text(
+        "import os\n"
+        "def test_output():\n"
+        "    os.write(1, b'x' * 8_000_000)\n"
+        "    os.write(2, b'y' * 8_000_000)\n"
+        "    assert False\n",
+        encoding="utf-8",
+    )
+
+    tracemalloc.start()
+    try:
+        result = CodebaseTools(repo, timeout_seconds=15).run_pytest("tests/test_output.py")
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert result["status"] == "failed"
+    assert len(result["output"]) <= 4000
+    assert peak < 6_000_000
+
+
+def _write_spawning_test(repo: Path, heartbeat: Path) -> None:
+    tests_dir = repo / "tests"
+    tests_dir.mkdir(parents=True)
+    child_code = (
+        "import pathlib, time\n"
+        f"p = pathlib.Path({str(heartbeat)!r})\n"
+        "while True:\n"
+        "    with p.open('ab') as f: f.write(b'x')\n"
+        "    time.sleep(0.05)\n"
+    )
+    (tests_dir / "test_spawn.py").write_text(
+        "import subprocess, sys, time\n"
+        "def test_spawn():\n"
+        f"    subprocess.Popen([sys.executable, '-c', {child_code!r}])\n"
+        "    time.sleep(30)\n",
+        encoding="utf-8",
+    )
+
+
+def _assert_heartbeat_stopped(heartbeat: Path) -> None:
+    assert heartbeat.exists(), "child process never started"
+    size = heartbeat.stat().st_size
+    time.sleep(0.3)
+    assert heartbeat.stat().st_size == size
+
+
+def test_pytest_timeout_kills_child_process(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    heartbeat = tmp_path / "heartbeat"
+    _write_spawning_test(repo, heartbeat)
+
+    with pytest.raises(ToolError, match="pytest timed out"):
+        CodebaseTools(repo, timeout_seconds=3).run_pytest("tests/test_spawn.py")
+    _assert_heartbeat_stopped(heartbeat)
+
+
+def test_pytest_cancellation_kills_child_process(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    heartbeat = tmp_path / "heartbeat"
+    _write_spawning_test(repo, heartbeat)
+
+    async def cancel_after_child_starts() -> None:
+        task = asyncio.create_task(CodebaseTools(repo, timeout_seconds=10).invoke("run_pytest", {"test_path": "tests/test_spawn.py"}))
+        for _ in range(100):
+            if heartbeat.exists():
+                break
+            await asyncio.sleep(0.05)
+        else:
+            task.cancel()
+            pytest.fail("child process never started")
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(cancel_after_child_starts())
+    _assert_heartbeat_stopped(heartbeat)
 
 
 def test_pytest_allows_in_repo_test_symlink(tmp_path: Path) -> None:
