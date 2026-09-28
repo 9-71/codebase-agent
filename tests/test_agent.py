@@ -1,7 +1,9 @@
 import asyncio
 from pathlib import Path
+import subprocess
 import sys
 import time
+import tracemalloc
 
 import pytest
 from fastapi.testclient import TestClient
@@ -127,6 +129,114 @@ def test_allowlisted_pytest_is_executed() -> None:
     assert result["status"] == "passed"
 
 
+def _scripted_pytest(monkeypatch: pytest.MonkeyPatch, script: Path) -> None:
+    original_popen = subprocess.Popen
+
+    def launch(command: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        assert command[:3] == [sys.executable, "-m", "pytest"]
+        assert "-s" in command
+        return original_popen([sys.executable, str(script)], **kwargs)
+
+    monkeypatch.setattr("app.tools.subprocess.Popen", launch)
+
+
+def _test_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "repo"
+    tests_dir = repo / "tests"
+    tests_dir.mkdir(parents=True)
+    (tests_dir / "test_sample.py").write_text("def test_sample(): pass\n", encoding="utf-8")
+    return repo
+
+
+def test_pytest_output_is_bounded_while_running(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo = _test_repo(tmp_path)
+    script = tmp_path / "noisy.py"
+    script.write_text(
+        "import os\n"
+        "for fd, char in ((1, b'A'), (2, b'B')):\n"
+        "    for _ in range(2048): os.write(fd, char * 16384)\n"
+        "os.write(1, b'STDOUT_END')\n"
+        "os.write(2, b'STDERR_END')\n",
+        encoding="utf-8",
+    )
+    _scripted_pytest(monkeypatch, script)
+    tracemalloc.start()
+    try:
+        result = CodebaseTools(repo, timeout_seconds=10).run_pytest("tests/test_sample.py")
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert result["status"] == "passed"
+    assert result["output"].endswith("STDERR_END")
+    assert len(result["output"]) == 4000
+    assert peak < 2_000_000
+
+
+def _spawned_child_script(tmp_path: Path, repo: Path, *, parent_exits: bool = False) -> tuple[Path, Path, Path]:
+    ready = repo / "ready"
+    marker = repo / "child_survived"
+    child = tmp_path / "child.py"
+    child.write_text(
+        "import pathlib, time\n"
+        "time.sleep(1.5)\n"
+        f"pathlib.Path({str(marker)!r}).write_text('survived')\n",
+        encoding="utf-8",
+    )
+    parent = tmp_path / "parent.py"
+    parent.write_text(
+        "import pathlib, subprocess, sys, time\n"
+        f"subprocess.Popen([sys.executable, {str(child)!r}])\n"
+        f"pathlib.Path({str(ready)!r}).write_text('ready')\n"
+        + ("" if parent_exits else "time.sleep(10)\n"),
+        encoding="utf-8",
+    )
+    return parent, ready, marker
+
+
+@pytest.mark.parametrize("parent_exits", [False, True])
+def test_pytest_timeout_kills_child_process(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, parent_exits: bool) -> None:
+    repo = _test_repo(tmp_path)
+    parent, ready, marker = _spawned_child_script(tmp_path, repo, parent_exits=parent_exits)
+    _scripted_pytest(monkeypatch, parent)
+    with pytest.raises(ToolError, match="pytest timed out"):
+        CodebaseTools(repo, timeout_seconds=0.8).run_pytest("tests/test_sample.py")
+    assert ready.exists()
+    time.sleep(1)
+    assert not marker.exists()
+
+
+def test_pytest_invoke_cancellation_kills_child_process(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo = _test_repo(tmp_path)
+    parent, ready, marker = _spawned_child_script(tmp_path, repo)
+    _scripted_pytest(monkeypatch, parent)
+
+    async def cancel_after_spawn() -> None:
+        task = asyncio.create_task(CodebaseTools(repo, timeout_seconds=5).invoke("run_pytest", {"test_path": "tests/test_sample.py"}))
+        for _ in range(100):
+            if ready.exists():
+                break
+            await asyncio.sleep(0.02)
+        assert ready.exists()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(cancel_after_spawn())
+    time.sleep(1.6)
+    assert not marker.exists()
+
+
+def test_pytest_invoke_timeout_kills_child_process(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo = _test_repo(tmp_path)
+    parent, ready, marker = _spawned_child_script(tmp_path, repo)
+    _scripted_pytest(monkeypatch, parent)
+    with pytest.raises(ToolError, match="timed out"):
+        asyncio.run(CodebaseTools(repo, timeout_seconds=0.8).invoke("run_pytest", {"test_path": "tests/test_sample.py"}))
+    assert ready.exists()
+    time.sleep(1)
+    assert not marker.exists()
+
+
 def test_pytest_path_falls_back_to_fixture_repo() -> None:
     result = CodebaseTools(Path(__file__).parent.parent).run_pytest("tests/test_smoke.py")
     assert result["status"] == "passed"
@@ -161,7 +271,7 @@ def test_pytest_rejects_external_symlinks(tmp_path: Path, monkeypatch: pytest.Mo
     else:
         make_symlink(repo / "tests" / "fixture_repo", external, directory=True)
 
-    monkeypatch.setattr("app.tools.subprocess.run", lambda *args, **kwargs: pytest.fail("pytest must not run"))
+    monkeypatch.setattr("app.tools.subprocess.Popen", lambda *args, **kwargs: pytest.fail("pytest must not run"))
     with pytest.raises(ToolError, match="escapes repository root"):
         CodebaseTools(repo).run_pytest("tests/test_escape.py")
 
@@ -182,7 +292,7 @@ def test_pytest_checks_resolved_fallback_location(tmp_path: Path, monkeypatch: p
         return original_resolve(path, *args, **kwargs)
 
     monkeypatch.setattr(Path, "resolve", resolve_path)
-    monkeypatch.setattr("app.tools.subprocess.run", lambda *args, **kwargs: pytest.fail("pytest must not run"))
+    monkeypatch.setattr("app.tools.subprocess.Popen", lambda *args, **kwargs: pytest.fail("pytest must not run"))
     with pytest.raises(ToolError, match="escapes repository root"):
         tools.run_pytest("tests/test_escape.py")
 
@@ -204,7 +314,7 @@ def test_pytest_checks_resolved_direct_location(tmp_path: Path, monkeypatch: pyt
         return original_resolve(path, *args, **kwargs)
 
     monkeypatch.setattr(Path, "resolve", resolve_path)
-    monkeypatch.setattr("app.tools.subprocess.run", lambda *args, **kwargs: pytest.fail("pytest must not run"))
+    monkeypatch.setattr("app.tools.subprocess.Popen", lambda *args, **kwargs: pytest.fail("pytest must not run"))
     with pytest.raises(ToolError, match="repository root|allowed tests directory"):
         tools.run_pytest("tests/test_escape.py")
 
@@ -216,7 +326,7 @@ def test_pytest_rejects_test_symlink_to_non_test_repo_file(tmp_path: Path, monke
     source.write_text("def test_escape(): raise AssertionError('unexpected test executed')\n", encoding="utf-8")
     make_symlink(repo / "tests" / "test_escape.py", source)
 
-    monkeypatch.setattr("app.tools.subprocess.run", lambda *args, **kwargs: pytest.fail("pytest must not run"))
+    monkeypatch.setattr("app.tools.subprocess.Popen", lambda *args, **kwargs: pytest.fail("pytest must not run"))
     with pytest.raises(ToolError, match="allowed tests directory"):
         CodebaseTools(repo).run_pytest("tests/test_escape.py")
 
@@ -229,7 +339,7 @@ def test_pytest_broken_symlink_does_not_select_fallback(tmp_path: Path, monkeypa
     fallback_dir.mkdir(parents=True)
     (fallback_dir / "test_missing.py").write_text("def test_missing(): raise AssertionError('fallback test executed')\n", encoding="utf-8")
 
-    monkeypatch.setattr("app.tools.subprocess.run", lambda *args, **kwargs: pytest.fail("pytest must not run"))
+    monkeypatch.setattr("app.tools.subprocess.Popen", lambda *args, **kwargs: pytest.fail("pytest must not run"))
     with pytest.raises(ToolError, match="test file does not exist"):
         CodebaseTools(repo).run_pytest("tests/test_missing.py")
 

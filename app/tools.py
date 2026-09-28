@@ -1,14 +1,56 @@
 from pathlib import Path
 import asyncio
+import codecs
+import ctypes
 import fnmatch
+import io
+import locale
+import os
 import subprocess
 import sys
+import threading
 import time
 from typing import Any, Callable
 
 
 class ToolError(Exception):
     pass
+
+
+def _windows_job(process: subprocess.Popen[bytes]) -> int:
+    """Put pytest in a job so its descendants can be terminated together."""
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateJobObjectW.argtypes = (ctypes.c_void_p, ctypes.c_wchar_p)
+    kernel32.CreateJobObjectW.restype = ctypes.c_void_p
+    kernel32.AssignProcessToJobObject.argtypes = (ctypes.c_void_p, ctypes.c_void_p)
+    kernel32.AssignProcessToJobObject.restype = ctypes.c_int
+    job = kernel32.CreateJobObjectW(None, None)
+    if not job:
+        raise OSError(ctypes.get_last_error(), "CreateJobObjectW failed")
+    if not kernel32.AssignProcessToJobObject(job, int(process._handle)):
+        error = ctypes.get_last_error()
+        kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+        kernel32.CloseHandle(job)
+        raise OSError(error, "AssignProcessToJobObject failed")
+    return job
+
+
+def _stop_pytest_tree(process: subprocess.Popen[bytes], job: int | None) -> None:
+    if os.name == "nt":
+        if job is not None:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.TerminateJobObject.argtypes = (ctypes.c_void_p, ctypes.c_uint)
+            if not kernel32.TerminateJobObject(job, 1):
+                raise OSError(ctypes.get_last_error(), "TerminateJobObject failed")
+        else:
+            process.kill()
+    else:
+        import signal
+
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
 
 
 class CodebaseTools:
@@ -92,6 +134,9 @@ class CodebaseTools:
         return {"path": path, "start_line": start_line, "end_line": min(end_line, len(lines)), "content": "\n".join(lines[start_line - 1:end_line])}
 
     def run_pytest(self, test_path: str) -> dict[str, Any]:
+        return self._run_pytest(test_path)
+
+    def _run_pytest(self, test_path: str, cancel_event: threading.Event | None = None) -> dict[str, Any]:
         requested = Path(test_path)
         if (
             requested.is_absolute()
@@ -111,27 +156,79 @@ class CodebaseTools:
             if not target.is_file():
                 raise ToolError("test file does not exist")
         command_path = target.relative_to(self.repo_root).as_posix()
-        try:
-            completed = subprocess.run(
-                [sys.executable, "-m", "pytest", command_path, "-q", "-p", "no:cacheprovider"],
-                cwd=self.repo_root,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout_seconds,
-                check=False,
+        process = subprocess.Popen(
+            [sys.executable, "-m", "pytest", command_path, "-q", "-s", "-p", "no:cacheprovider"],
+            cwd=self.repo_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=os.name != "nt",
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+        )
+        job: int | None = None
+        readers: list[threading.Thread] = []
+        tails = ["", ""]
+
+        def drain(index: int, stream: Any) -> None:
+            decoder = io.IncrementalNewlineDecoder(
+                codecs.getincrementaldecoder(locale.getpreferredencoding(False))(errors="replace"),
+                translate=True,
             )
-        except subprocess.TimeoutExpired as exc:
-            raise ToolError("pytest timed out") from exc
-        output = (completed.stdout + completed.stderr)[-4000:]
-        return {"status": "passed" if completed.returncode == 0 else "failed", "returncode": completed.returncode, "output": output}
+            while chunk := stream.read1(16_384):
+                tails[index] = (tails[index] + decoder.decode(chunk))[-4000:]
+            tails[index] = (tails[index] + decoder.decode(b"", final=True))[-4000:]
+            stream.close()
+
+        try:
+            if os.name == "nt":
+                job = _windows_job(process)
+            for index, stream in enumerate((process.stdout, process.stderr)):
+                assert stream is not None
+                reader = threading.Thread(target=drain, args=(index, stream), daemon=True)
+                reader.start()
+                readers.append(reader)
+            deadline = time.monotonic() + self.timeout_seconds
+            while process.poll() is None or any(reader.is_alive() for reader in readers):
+                if cancel_event is not None and cancel_event.is_set():
+                    raise ToolError("pytest cancelled")
+                if time.monotonic() >= deadline:
+                    raise ToolError("pytest timed out")
+                time.sleep(min(0.02, max(0, deadline - time.monotonic())))
+            output = (tails[0] + tails[1])[-4000:]
+            return {"status": "passed" if process.returncode == 0 else "failed", "returncode": process.returncode, "output": output}
+        except BaseException:
+            _stop_pytest_tree(process, job)
+            raise
+        finally:
+            process.wait()
+            for reader in readers:
+                reader.join()
+            if job is not None:
+                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+                kernel32.CloseHandle(job)
 
     async def invoke(self, name: str, arguments: dict[str, Any]) -> tuple[dict[str, Any], float]:
         handler = self._handlers.get(name)
         if handler is None:
             raise ToolError(f"unknown tool: {name}")
         started = time.perf_counter()
-        try:
-            result = await asyncio.wait_for(asyncio.to_thread(handler, **arguments), timeout=self.timeout_seconds)
-        except asyncio.TimeoutError as exc:
-            raise ToolError("tool timed out") from exc
+        if name == "run_pytest":
+            cancel_event = threading.Event()
+            worker = asyncio.create_task(asyncio.to_thread(self._run_pytest, **arguments, cancel_event=cancel_event))
+            try:
+                result = await asyncio.wait_for(asyncio.shield(worker), timeout=self.timeout_seconds)
+            except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
+                cancel_event.set()
+                try:
+                    await asyncio.shield(worker)
+                except ToolError:
+                    pass
+                if isinstance(exc, asyncio.TimeoutError):
+                    raise ToolError("tool timed out") from exc
+                raise
+        else:
+            try:
+                result = await asyncio.wait_for(asyncio.to_thread(handler, **arguments), timeout=self.timeout_seconds)
+            except asyncio.TimeoutError as exc:
+                raise ToolError("tool timed out") from exc
         return result, (time.perf_counter() - started) * 1000
