@@ -2,6 +2,7 @@ import asyncio
 from pathlib import Path
 import sys
 import time
+import tracemalloc
 
 import pytest
 from fastapi.testclient import TestClient
@@ -161,7 +162,7 @@ def test_pytest_rejects_external_symlinks(tmp_path: Path, monkeypatch: pytest.Mo
     else:
         make_symlink(repo / "tests" / "fixture_repo", external, directory=True)
 
-    monkeypatch.setattr("app.tools.subprocess.run", lambda *args, **kwargs: pytest.fail("pytest must not run"))
+    monkeypatch.setattr("app.tools.subprocess.Popen", lambda *args, **kwargs: pytest.fail("pytest must not run"))
     with pytest.raises(ToolError, match="escapes repository root"):
         CodebaseTools(repo).run_pytest("tests/test_escape.py")
 
@@ -182,7 +183,7 @@ def test_pytest_checks_resolved_fallback_location(tmp_path: Path, monkeypatch: p
         return original_resolve(path, *args, **kwargs)
 
     monkeypatch.setattr(Path, "resolve", resolve_path)
-    monkeypatch.setattr("app.tools.subprocess.run", lambda *args, **kwargs: pytest.fail("pytest must not run"))
+    monkeypatch.setattr("app.tools.subprocess.Popen", lambda *args, **kwargs: pytest.fail("pytest must not run"))
     with pytest.raises(ToolError, match="escapes repository root"):
         tools.run_pytest("tests/test_escape.py")
 
@@ -204,7 +205,7 @@ def test_pytest_checks_resolved_direct_location(tmp_path: Path, monkeypatch: pyt
         return original_resolve(path, *args, **kwargs)
 
     monkeypatch.setattr(Path, "resolve", resolve_path)
-    monkeypatch.setattr("app.tools.subprocess.run", lambda *args, **kwargs: pytest.fail("pytest must not run"))
+    monkeypatch.setattr("app.tools.subprocess.Popen", lambda *args, **kwargs: pytest.fail("pytest must not run"))
     with pytest.raises(ToolError, match="repository root|allowed tests directory"):
         tools.run_pytest("tests/test_escape.py")
 
@@ -216,7 +217,7 @@ def test_pytest_rejects_test_symlink_to_non_test_repo_file(tmp_path: Path, monke
     source.write_text("def test_escape(): raise AssertionError('unexpected test executed')\n", encoding="utf-8")
     make_symlink(repo / "tests" / "test_escape.py", source)
 
-    monkeypatch.setattr("app.tools.subprocess.run", lambda *args, **kwargs: pytest.fail("pytest must not run"))
+    monkeypatch.setattr("app.tools.subprocess.Popen", lambda *args, **kwargs: pytest.fail("pytest must not run"))
     with pytest.raises(ToolError, match="allowed tests directory"):
         CodebaseTools(repo).run_pytest("tests/test_escape.py")
 
@@ -229,7 +230,7 @@ def test_pytest_broken_symlink_does_not_select_fallback(tmp_path: Path, monkeypa
     fallback_dir.mkdir(parents=True)
     (fallback_dir / "test_missing.py").write_text("def test_missing(): raise AssertionError('fallback test executed')\n", encoding="utf-8")
 
-    monkeypatch.setattr("app.tools.subprocess.run", lambda *args, **kwargs: pytest.fail("pytest must not run"))
+    monkeypatch.setattr("app.tools.subprocess.Popen", lambda *args, **kwargs: pytest.fail("pytest must not run"))
     with pytest.raises(ToolError, match="test file does not exist"):
         CodebaseTools(repo).run_pytest("tests/test_missing.py")
 
@@ -241,9 +242,90 @@ def test_pytest_does_not_search_for_same_named_file(tmp_path: Path, monkeypatch:
     other.mkdir(parents=True)
     (other / "test_unexpected.py").write_text("def test_unexpected(): raise AssertionError('unexpected test executed')\n", encoding="utf-8")
 
-    monkeypatch.setattr("app.tools.subprocess.run", lambda *args, **kwargs: pytest.fail("pytest must not run"))
+    monkeypatch.setattr("app.tools.subprocess.Popen", lambda *args, **kwargs: pytest.fail("pytest must not run"))
     with pytest.raises(ToolError, match="test file does not exist"):
         CodebaseTools(repo).run_pytest("tests/test_unexpected.py")
+
+
+def test_pytest_output_is_bounded_while_running(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    tests_dir = repo / "tests"
+    tests_dir.mkdir(parents=True)
+    (tests_dir / "test_noisy.py").write_text(
+        "import sys\n"
+        "def test_noisy():\n"
+        "    sys.stdout.write('x' * 8_000_000)\n"
+        "    sys.stderr.write('y' * 8_000_000)\n"
+        "    assert False\n",
+        encoding="utf-8",
+    )
+    tracemalloc.start()
+    try:
+        result = CodebaseTools(repo, timeout_seconds=15).run_pytest("tests/test_noisy.py")
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert result["status"] == "failed"
+    assert len(result["output"]) <= 4000
+    assert peak < 2_000_000
+
+
+def _write_child_test(repo: Path, started: Path, marker: Path) -> None:
+    tests_dir = repo / "tests"
+    tests_dir.mkdir(parents=True)
+    child_code = f"import time; from pathlib import Path; time.sleep(2); Path({str(marker)!r}).write_text('alive')"
+    (tests_dir / "test_child.py").write_text(
+        "import subprocess\nimport sys\nimport time\nfrom pathlib import Path\n"
+        "def test_child():\n"
+        f"    subprocess.Popen([sys.executable, '-c', {child_code!r}])\n"
+        f"    Path({str(started)!r}).write_text('started')\n"
+        "    time.sleep(60)\n",
+        encoding="utf-8",
+    )
+
+
+def test_pytest_timeout_kills_child_process(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    started, marker = tmp_path / "started", tmp_path / "survived"
+    _write_child_test(repo, started, marker)
+    with pytest.raises(ToolError, match="pytest timed out"):
+        CodebaseTools(repo, timeout_seconds=1).run_pytest("tests/test_child.py")
+    assert started.exists()
+    time.sleep(2.2)
+    assert not marker.exists()
+
+
+def test_pytest_invoke_timeout_kills_child_process(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    started, marker = tmp_path / "started", tmp_path / "survived"
+    _write_child_test(repo, started, marker)
+    with pytest.raises(ToolError, match="timed out"):
+        asyncio.run(CodebaseTools(repo, timeout_seconds=1).invoke("run_pytest", {"test_path": "tests/test_child.py"}))
+    assert started.exists()
+    time.sleep(2.2)
+    assert not marker.exists()
+
+
+def test_pytest_invoke_cancellation_kills_child_process(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    started, marker = tmp_path / "started", tmp_path / "survived"
+    _write_child_test(repo, started, marker)
+
+    async def cancel_running_test() -> None:
+        tools = CodebaseTools(repo, timeout_seconds=10)
+        task = asyncio.create_task(tools.invoke("run_pytest", {"test_path": "tests/test_child.py"}))
+        for _ in range(100):
+            if started.exists():
+                break
+            await asyncio.sleep(0.05)
+        assert started.exists()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(cancel_running_test())
+    time.sleep(2.2)
+    assert not marker.exists()
 
 
 class FlakyModel:
